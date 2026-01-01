@@ -1,29 +1,30 @@
-# botwa-golang
-Bot WhatsApp berbasis Golang menggunakan library Whatsmeow. Dirancang ringan, modular, dan mudah dikembangkan untuk otomatisasi pesan, handler command, serta eksperimen bot WhatsApp berbasis Go. Cocok untuk pemula maupun developer yang ingin belajar WhatsApp bot dengan Golang.
-WhatsApp Bot Golang (Whatsmeow)
-Bot WhatsApp berbasis Golang menggunakan library Whatsmeow. Project ini dibuat untuk pembelajaran dan pengembangan bot WhatsApp dengan struktur kode yang sederhana, ringan, dan mudah dikembangkan.
-Fitur
-WhatsApp Bot berbasis Whatsmeow
-Handler pesan & command
-Struktur modular
-Ringan dan cepat
-Mudah dikembangkan
-Persyaratan
-Go 1.20 atau lebih baru
-Akun WhatsApp aktif
-Koneksi internet stabil
-Instalasi
-Salin kode
-Bash
-git clone https://github.com/username/repository.git
-cd repository
+# WhatsApp Bot Golang (Whatsmeow)
+
+Bot WhatsApp berbasis **Golang** menggunakan library **Whatsmeow** (Unofficial WhatsApp Web API). Repository ini dibuat untuk pembelajaran dan pengembangan bot WhatsApp dengan struktur kode yang rapi, modular, dan mudah dikembangkan.
+
+---
+
+## Fitur
+- Login WhatsApp via QR Code
+- Session tersimpan otomatis (tanpa scan ulang)
+- Handler pesan & command
+- Struktur project modular
+- Ringan dan cepat
+
+---
+
+## Teknologi
+- Golang
+- Whatsmeow
+- SQLite (penyimpanan session)
+
+---
+
+---
+
+## Instalasi
+```bash
+git clone https://github.com/username/botwa-golang.git
+cd botwa-golang
 go mod tidy
 go run main.go
-Cara Login
-Jalankan bot
-Scan QR Code menggunakan WhatsApp
-Session akan tersimpan otomatis
-Catatan
-Project ini menggunakan unofficial WhatsApp API. Gunakan dengan bijak dan risiko ditanggung masing-masing.
-Lisensi
-MIT License

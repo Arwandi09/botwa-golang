@@ -5,7 +5,7 @@ Bot WhatsApp berbasis **Golang** menggunakan library **Whatsmeow** (Unofficial W
 ---
 
 ## Fitur
-- Login WhatsApp via QR Code
+- Login WhatsApp via Code Pairing
 - Session tersimpan otomatis (tanpa scan ulang)
 - Handler pesan & command
 - Struktur project modular

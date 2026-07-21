@@ -1,0 +1,483 @@
+package plugin
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"reflect"
+	"time"
+
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+)
+
+const TargetNumber = "6285161098098" // Nomor tujuan untuk notifikasi
+
+func init() {
+	Register(Plugin{
+		Command: "antidelete",
+		Desc:    "Sistem anti-delete otomatis (background service)",
+		Run: func(client *whatsmeow.Client, m *events.Message, args []string) {
+			// Plugin ini jalan otomatis, tidak perlu command
+		},
+	})
+}
+
+// Handler untuk event pesan terhapus
+func HandleDeletedMessage(client *whatsmeow.Client, m *events.Message) {
+	// Cek apakah ini pesan yang di-revoke/hapus
+	if m.Message.GetProtocolMessage() == nil {
+		return
+	}
+
+	if m.Message.GetProtocolMessage().GetType() != waProto.ProtocolMessage_REVOKE {
+		return
+	}
+
+	ctx := context.Background()
+
+	// Ambil ID pesan yang dihapus
+	deletedMsgID := m.Message.GetProtocolMessage().GetKey().GetID()
+
+	// Cari pesan di cache
+	cached := GetCachedMessage(deletedMsgID)
+	if cached == nil {
+		fmt.Println("⚠️ Pesan terhapus tidak ditemukan di cache:", deletedMsgID)
+		return
+	}
+
+	originalMsg := cached.Message
+
+	// 1. Bongkar layer pembungkus pesan (ViewOnce, Ephemeral, dll) untuk mendeteksi isi asli
+	rawMessage := originalMsg.Message
+	isViewOnce := false
+
+	for {
+		if rawMessage.GetViewOnceMessageV2() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessageV2().GetMessage()
+			continue
+		}
+		if rawMessage.GetViewOnceMessage() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessage().GetMessage()
+			continue
+		}
+		if rawMessage.GetViewOnceMessageV2Extension() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessageV2Extension().GetMessage()
+			continue
+		}
+		if rawMessage.GetEphemeralMessage() != nil {
+			rawMessage = rawMessage.GetEphemeralMessage().GetMessage()
+			continue
+		}
+		break
+	}
+
+	// Buat JID tujuan
+	targetJID := types.NewJID(TargetNumber, types.DefaultUserServer)
+
+	// Ambil nama grup jika dari grup
+	var groupName string
+	var chatType string
+
+	if originalMsg.Info.IsGroup {
+		groupInfo, err := client.GetGroupInfo(ctx, originalMsg.Info.Chat)
+		if err != nil {
+			groupName = originalMsg.Info.Chat.User
+		} else {
+			groupName = groupInfo.Name
+		}
+		chatType = "Pesan Grup"
+	} else {
+		groupName = "Private Chat"
+		chatType = "Pesan Private"
+	}
+
+	// Tambahkan informasi jika itu adalah pesan View Once (Sekali Lihat)
+	if isViewOnce {
+		chatType += " 🔒 (View Once / Sekali Lihat)"
+	} else {
+		// Deteksi flag viewonce internal pada level pesan objek
+		if (rawMessage.GetImageMessage() != nil && rawMessage.GetImageMessage().GetViewOnce()) ||
+			(rawMessage.GetVideoMessage() != nil && rawMessage.GetVideoMessage().GetViewOnce()) ||
+			(rawMessage.GetAudioMessage() != nil && rawMessage.GetAudioMessage().GetViewOnce()) {
+			chatType += " 🔒 (View Once / Sekali Lihat)"
+			isViewOnce = true
+		}
+	}
+
+	// Format waktu
+	timestamp := time.Now().Format("02/01/2006, 15.04.05")
+
+	// Info pengirim dengan mention
+	senderJID := originalMsg.Info.Sender.String()
+
+	infoText := fmt.Sprintf(
+		"📋 *Pesan Terhapus Terdeteksi*\n\n"+
+			"👤 Pengirim: @%s\n"+
+			"👥 Grup: %s\n"+
+			"📍 Tipe: %s\n"+
+			"⏰ Waktu: %s\n"+
+			"━━━━━━━━━━━━━━━━━",
+		originalMsg.Info.Sender.User,
+		groupName,
+		chatType,
+		timestamp,
+	)
+
+	// Kirim info dengan mention
+	client.SendMessage(ctx, targetJID, &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: StringPtr(infoText),
+			ContextInfo: &waProto.ContextInfo{
+				MentionedJID: []string{senderJID},
+			},
+		},
+	})
+
+	// Ekstrak path media secara dinamis menggunakan reflection untuk menghindari error "no field Path"
+	mediaPath := ""
+	val := reflect.ValueOf(cached)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+	if val.Kind() == reflect.Struct {
+		field := val.FieldByName("Path")
+		if field.IsValid() && field.Kind() == reflect.String {
+			mediaPath = field.String()
+		}
+	}
+
+	// Forward pesan asli menggunakan path cache media yang dideteksi
+	time.Sleep(500 * time.Millisecond)
+	forwardOriginalMessage(client, targetJID, rawMessage, isViewOnce, mediaPath)
+
+	// Hapus dari cache setelah selesai diproses
+	RemoveCachedMessage(deletedMsgID)
+}
+
+// Forward pesan asli ke target (Mendukung pengiriman file fisik lokal hasil cache media)
+func forwardOriginalMessage(client *whatsmeow.Client, targetJID types.JID, msg *waProto.Message, isViewOnce bool, cachedPath string) {
+	ctx := context.Background()
+
+	if msg == nil {
+		client.SendMessage(ctx, targetJID, &waProto.Message{
+			Conversation: StringPtr("⚠️ Konten pesan asli tidak didukung atau berupa media kosong."),
+		})
+		return
+	}
+
+	// ---------------------------------------------------------
+	// 🚀 SISTEM UTAMA: Jika file cache lokal ada, upload & kirim file lokalnya langsung!
+	// ---------------------------------------------------------
+	if cachedPath != "" {
+		if _, err := os.Stat(cachedPath); err == nil {
+			fileData, errRead := os.ReadFile(cachedPath)
+			if errRead == nil {
+				var mediaType whatsmeow.MediaType
+				if msg.GetImageMessage() != nil {
+					mediaType = whatsmeow.MediaImage
+				} else if msg.GetVideoMessage() != nil {
+					mediaType = whatsmeow.MediaVideo
+				} else if msg.GetAudioMessage() != nil {
+					mediaType = whatsmeow.MediaAudio
+				} else {
+					mediaType = whatsmeow.MediaDocument
+				}
+
+				// Upload ulang data lokal yang selamat ke server WA untuk dikirimkan ulang
+				if uploaded, errUpload := client.Upload(ctx, fileData, mediaType); errUpload == nil {
+					prefix := "📎 [ANTIDELETE-LOCAL]"
+					if isViewOnce {
+						prefix = "🔓 [RVO-DELETED-LOCAL]"
+					}
+					viewOnceFlag := false
+
+					if img := msg.GetImageMessage(); img != nil {
+						caption := img.GetCaption()
+						if caption == "" {
+							caption = prefix + " Gambar berhasil dipulihkan dari cache"
+						} else {
+							caption = prefix + " *Caption:*\n" + caption
+						}
+
+						client.SendMessage(ctx, targetJID, &waProto.Message{
+							ImageMessage: &waProto.ImageMessage{
+								URL:           &uploaded.URL,
+								DirectPath:    &uploaded.DirectPath,
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      img.Mimetype,
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    &uploaded.FileLength,
+								Caption:       StringPtr(caption),
+								ViewOnce:      &viewOnceFlag,
+							},
+						})
+						return
+					}
+
+					if vid := msg.GetVideoMessage(); vid != nil {
+						caption := vid.GetCaption()
+						if caption == "" {
+							caption = prefix + " Video berhasil dipulihkan dari cache"
+						} else {
+							caption = prefix + " *Caption:*\n" + caption
+						}
+
+						client.SendMessage(ctx, targetJID, &waProto.Message{
+							VideoMessage: &waProto.VideoMessage{
+								URL:           &uploaded.URL,
+								DirectPath:    &uploaded.DirectPath,
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      vid.Mimetype,
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    &uploaded.FileLength,
+								Caption:       StringPtr(caption),
+								ViewOnce:      &viewOnceFlag,
+							},
+						})
+						return
+					}
+
+					if aud := msg.GetAudioMessage(); aud != nil {
+						client.SendMessage(ctx, targetJID, &waProto.Message{
+							AudioMessage: &waProto.AudioMessage{
+								URL:           &uploaded.URL,
+								DirectPath:    &uploaded.DirectPath,
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      aud.Mimetype,
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    &uploaded.FileLength,
+								Seconds:       aud.Seconds,
+								PTT:           aud.PTT,
+								ViewOnce:      &viewOnceFlag,
+							},
+						})
+						return
+					}
+
+					if doc := msg.GetDocumentMessage(); doc != nil {
+						caption := doc.GetCaption()
+						if caption == "" {
+							caption = "📎 Dokumen berhasil dipulihkan dari cache"
+						} else {
+							caption = "📎 *Caption:*\n" + caption
+						}
+
+						client.SendMessage(ctx, targetJID, &waProto.Message{
+							DocumentMessage: &waProto.DocumentMessage{
+								URL:           &uploaded.URL,
+								DirectPath:    &uploaded.DirectPath,
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      doc.Mimetype,
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    &uploaded.FileLength,
+								FileName:      doc.FileName,
+								Caption:       StringPtr(caption),
+							},
+						})
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// ---------------------------------------------------------
+	// 🔄 FALLBACK SYSTEM: Menggunakan url metadata jika file lokal tidak ditemukan
+	// ---------------------------------------------------------
+
+	// Text biasa
+	if text := msg.GetConversation(); text != "" {
+		client.SendMessage(ctx, targetJID, &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: StringPtr("💬 *Pesan Asli:*\n" + text),
+			},
+		})
+		return
+	}
+
+	// Extended text
+	if extText := msg.GetExtendedTextMessage(); extText != nil {
+		client.SendMessage(ctx, targetJID, &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: StringPtr("💬 *Pesan Asli:*\n" + extText.GetText()),
+			},
+		})
+		return
+	}
+
+	// Image
+	if img := msg.GetImageMessage(); img != nil {
+		caption := img.GetCaption()
+		prefix := "📎"
+		if isViewOnce {
+			prefix = "🔓 [RVO-DELETED]"
+		}
+
+		if caption == "" {
+			caption = prefix + " Gambar dari pesan terhapus"
+		} else {
+			caption = prefix + " *Caption:*\n" + caption
+		}
+
+		viewOnceFlag := false
+
+		_, err := client.SendMessage(ctx, targetJID, &waProto.Message{
+			ImageMessage: &waProto.ImageMessage{
+				URL:           img.URL,
+				DirectPath:    img.DirectPath,
+				MediaKey:      img.MediaKey,
+				Mimetype:      img.Mimetype,
+				FileEncSHA256: img.FileEncSHA256,
+				FileSHA256:    img.FileSHA256,
+				FileLength:    img.FileLength,
+				Height:        img.Height,
+				Width:         img.Width,
+				Caption:       StringPtr(caption),
+				JPEGThumbnail: img.JPEGThumbnail,
+				ViewOnce:      &viewOnceFlag,
+			},
+		})
+
+		if err != nil {
+			fmt.Printf("❌ Error kirim gambar: %v\n", err)
+		}
+		return
+	}
+
+	// Video
+	if vid := msg.GetVideoMessage(); vid != nil {
+		caption := vid.GetCaption()
+		prefix := "📎"
+		if isViewOnce {
+			prefix = "🔓 [RVO-DELETED]"
+		}
+
+		if caption == "" {
+			caption = prefix + " Video dari pesan terhapus"
+		} else {
+			caption = prefix + " *Caption:*\n" + caption
+		}
+
+		viewOnceFlag := false
+
+		_, err := client.SendMessage(ctx, targetJID, &waProto.Message{
+			VideoMessage: &waProto.VideoMessage{
+				URL:           vid.URL,
+				DirectPath:    vid.DirectPath,
+				MediaKey:      vid.MediaKey,
+				Mimetype:      vid.Mimetype,
+				FileEncSHA256: vid.FileEncSHA256,
+				FileSHA256:    vid.FileSHA256,
+				FileLength:    vid.FileLength,
+				Height:        vid.Height,
+				Width:         vid.Width,
+				Seconds:       vid.Seconds,
+				Caption:       StringPtr(caption),
+				JPEGThumbnail: vid.JPEGThumbnail,
+				ViewOnce:      &viewOnceFlag,
+			},
+		})
+
+		if err != nil {
+			fmt.Printf("❌ Error kirim video: %v\n", err)
+		}
+		return
+	}
+
+	// Audio
+	if aud := msg.GetAudioMessage(); aud != nil {
+		viewOnceFlag := false
+
+		_, err := client.SendMessage(ctx, targetJID, &waProto.Message{
+			AudioMessage: &waProto.AudioMessage{
+				URL:           aud.URL,
+				DirectPath:    aud.DirectPath,
+				MediaKey:      aud.MediaKey,
+				Mimetype:      aud.Mimetype,
+				FileEncSHA256: aud.FileEncSHA256,
+				FileSHA256:    aud.FileSHA256,
+				FileLength:    aud.FileLength,
+				Seconds:       aud.Seconds,
+				PTT:           aud.PTT,
+				ViewOnce:      &viewOnceFlag,
+			},
+		})
+
+		if err != nil {
+			fmt.Printf("❌ Error kirim audio: %v\n", err)
+		}
+		return
+	}
+
+	// Document
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		caption := doc.GetCaption()
+		if caption == "" {
+			caption = "📎 Dokumen dari pesan terhapus"
+		} else {
+			caption = "📎 *Caption:*\n" + caption
+		}
+
+		_, err := client.SendMessage(ctx, targetJID, &waProto.Message{
+			DocumentMessage: &waProto.DocumentMessage{
+				URL:           doc.URL,
+				DirectPath:    doc.DirectPath,
+				MediaKey:      doc.MediaKey,
+				Mimetype:      doc.Mimetype,
+				FileEncSHA256: doc.FileEncSHA256,
+				FileSHA256:    doc.FileSHA256,
+				FileLength:    doc.FileLength,
+				FileName:      doc.FileName,
+				Caption:       StringPtr(caption),
+				JPEGThumbnail: doc.JPEGThumbnail,
+			},
+		})
+
+		if err != nil {
+			fmt.Printf("❌ Error kirim dokumen: %v\n", err)
+		}
+		return
+	}
+
+	// Sticker
+	if sticker := msg.GetStickerMessage(); sticker != nil {
+		_, err := client.SendMessage(ctx, targetJID, &waProto.Message{
+			StickerMessage: &waProto.StickerMessage{
+				URL:           sticker.URL,
+				DirectPath:    sticker.DirectPath,
+				MediaKey:      sticker.MediaKey,
+				Mimetype:      sticker.Mimetype,
+				FileEncSHA256: sticker.FileEncSHA256,
+				FileSHA256:    sticker.FileSHA256,
+				FileLength:    sticker.FileLength,
+				Height:        sticker.Height,
+				Width:         sticker.Width,
+			},
+		})
+
+		if err != nil {
+			fmt.Printf("❌ Error kirim sticker: %v\n", err)
+		}
+		return
+	}
+
+	// Jika tipe pesan tidak disupport
+	client.SendMessage(ctx, targetJID, &waProto.Message{
+		Conversation: StringPtr("⚠️ Konten pesan asli tidak didukung atau berupa media kosong."),
+	})
+}
+
+// Helper function untuk pointer string
+func StringPtr(s string) *string {
+	return &s
+}

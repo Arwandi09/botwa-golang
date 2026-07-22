@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/binary/proto"
@@ -13,6 +14,7 @@ import (
 )
 
 // AntiViewOncePasif mendeteksi pesan View Once dari struktur protobuf mentah
+// dan meneruskan media ke nomor target dengan caption yang menjelaskan asal media.
 func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	ctx := context.Background()
 
@@ -26,136 +28,245 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		return false
 	}
 
+	// Variabel untuk media
 	var imgMsg *proto.ImageMessage
 	var vidMsg *proto.VideoMessage
 	var audMsg *proto.AudioMessage
+	var docMsg *proto.DocumentMessage
 	var isViewOnce bool
 
-	// LAPISAN 1: Periksa apakah dibungkus di dalam kontainer ViewOnceMessage
+	// 1) Unwrap ALL possible wrapper layers (ViewOnce v1/v2, ephemeral, extensions)
 	rawMessage := m.Message
-	if m.Message.GetViewOnceMessageV2() != nil {
-		rawMessage = m.Message.GetViewOnceMessageV2().GetMessage()
-		isViewOnce = true
-	} else if m.Message.GetViewOnceMessage() != nil {
-		rawMessage = m.Message.GetViewOnceMessage().GetMessage()
-		isViewOnce = true
+	for rawMessage != nil {
+		// Aggressively unwrap known wrapper types
+		if rawMessage.GetViewOnceMessageV2() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessageV2().GetMessage()
+			continue
+		}
+		if rawMessage.GetViewOnceMessage() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessage().GetMessage()
+			continue
+		}
+		if rawMessage.GetViewOnceMessageV2Extension() != nil {
+			isViewOnce = true
+			rawMessage = rawMessage.GetViewOnceMessageV2Extension().GetMessage()
+			continue
+		}
+		if rawMessage.GetEphemeralMessage() != nil {
+			rawMessage = rawMessage.GetEphemeralMessage().GetMessage()
+			continue
+		}
+		// Nothing left to unwrap
+		break
 	}
 
 	if rawMessage == nil {
 		return false
 	}
 
-	// LAPISAN 2: Ambil objek media dan periksa flag internalnya jika kontainer luar kosong
+	// 2) Extract internal media objects and check their view-once flags
 	if rawMessage.GetImageMessage() != nil {
 		imgMsg = rawMessage.GetImageMessage()
 		if imgMsg.GetViewOnce() {
 			isViewOnce = true
 		}
-	} else if rawMessage.GetVideoMessage() != nil {
+	}
+	if rawMessage.GetVideoMessage() != nil {
 		vidMsg = rawMessage.GetVideoMessage()
 		if vidMsg.GetViewOnce() {
 			isViewOnce = true
 		}
-	} else if rawMessage.GetAudioMessage() != nil {
+	}
+	if rawMessage.GetAudioMessage() != nil {
 		audMsg = rawMessage.GetAudioMessage()
 		if audMsg.GetViewOnce() {
 			isViewOnce = true
 		}
 	}
+	if rawMessage.GetDocumentMessage() != nil {
+		docMsg = rawMessage.GetDocumentMessage()
+		// Documents sometimes carry images/videos as documents (e.g., GIFs) and may be view-once
+		// there's no explicit ViewOnce on DocumentMessage in some protobuf versions, so keep doc as possible
+	}
 
-	// Jika setelah diperiksa ke semua lapisan tetap bukan View Once, abaikan
-	if !isViewOnce || (imgMsg == nil && vidMsg == nil && audMsg == nil) {
+	// If still not view-once or no media found, ignore
+	if !isViewOnce || (imgMsg == nil && vidMsg == nil && audMsg == nil && docMsg == nil) {
 		return false
 	}
 
-	// Kirim kode reaksi tanda bot mulai memproses sadapan di background
+	// 3) Reaction: indicate processing started
 	sendReactionRVO(client, m.Info.Chat, m.Info.ID, "🕒")
+
+	// 4) Prepare source info for caption
+	senderNumber := "unknown"
+	if m.Info.Sender != nil {
+		senderNumber = m.Info.Sender.User
+	}
+	senderName := m.Info.PushName
+	if strings.TrimSpace(senderName) == "" {
+		senderName = senderNumber
+	}
+	origin := "Private"
+	groupName := "-"
+	if m.Info.IsGroup {
+		origin = "Grup"
+		// Try to fetch group name (best-effort)
+		if gi, err := client.GetGroupInfo(ctx, m.Info.Chat); err == nil {
+			groupName = gi.GetName()
+		} else {
+			// fallback to chat id
+			groupName = m.Info.Chat.String()
+		}
+	}
+
+	baseCaptionPrefix := fmt.Sprintf("[RVO PASIF] Dari: %s\nNama: %s\nNomor: %s\nGrup: %s\n", origin, senderName, senderNumber, groupName)
 
 	var data []byte
 	var err error
 
-	// 3. Proses Download & Meneruskan ke Target Nomor
-	if imgMsg != nil {
-		data, err = client.Download(ctx, imgMsg)
-		if err == nil {
-			uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaImage)
-			if errUpload == nil {
-				captionStr := fmt.Sprintf("[RVO PASIF - %s]\n%s", m.Info.PushName, imgMsg.GetCaption())
-				client.SendMessage(ctx, targetJID, &proto.Message{
-					ImageMessage: &proto.ImageMessage{
-						URL:           &uploaded.URL,
-						DirectPath:    &uploaded.DirectPath,
-						MediaKey:      uploaded.MediaKey,
-						FileEncSHA256: uploaded.FileEncSHA256,
-						FileSHA256:    uploaded.FileSHA256,
-						FileLength:    &uploaded.FileLength,
-						Mimetype:      imgMsg.Mimetype,
-						Caption:       &captionStr,
-					},
-				})
-				sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
-			}
-		}
-	} else if vidMsg != nil {
-		data, err = client.Download(ctx, vidMsg)
-		if err == nil {
-			uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaVideo)
-			if errUpload == nil {
-				captionStr := fmt.Sprintf("[RVO PASIF - %s]\n%s", m.Info.PushName, vidMsg.GetCaption())
-				client.SendMessage(ctx, targetJID, &proto.Message{
-					VideoMessage: &proto.VideoMessage{
-						URL:           &uploaded.URL,
-						DirectPath:    &uploaded.DirectPath,
-						MediaKey:      uploaded.MediaKey,
-						FileEncSHA256: uploaded.FileEncSHA256,
-						FileSHA256:    uploaded.FileSHA256,
-						FileLength:    &uploaded.FileLength,
-						Mimetype:      vidMsg.Mimetype,
-						Caption:       &captionStr,
-					},
-				})
-				sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
-			}
-		}
-	} else if audMsg != nil {
-		data, err = client.Download(ctx, audMsg)
-		if err == nil {
-			fileInput := fmt.Sprintf("temp_pasif_in_%s.ogg", m.Info.ID)
-			fileOutput := fmt.Sprintf("temp_pasif_out_%s.mp3", m.Info.ID)
-
-			err = os.WriteFile(fileInput, data, 0644)
-			if err == nil {
-				cmd := exec.Command("ffmpeg", "-y", "-i", fileInput, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", fileOutput)
-				if errCmd := cmd.Run(); errCmd == nil {
-					audioData, errRead := os.ReadFile(fileOutput)
-					if errRead == nil {
-						uploaded, errUpload := client.Upload(ctx, audioData, whatsmeow.MediaAudio)
-						if errUpload == nil {
-							isPTT := true
-							mpegMime := "audio/mpeg"
-							client.SendMessage(ctx, targetJID, &proto.Message{
-								AudioMessage: &proto.AudioMessage{
-									URL:           &uploaded.URL,
-									DirectPath:    &uploaded.DirectPath,
-									MediaKey:      uploaded.MediaKey,
-									FileEncSHA256: uploaded.FileEncSHA256,
-									FileSHA256:    uploaded.FileSHA256,
-									FileLength:    &uploaded.FileLength,
-									Mimetype:      &mpegMime,
-									PTT:           &isPTT,
-								},
-							})
-							sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
-						}
-					}
-				}
-				os.Remove(fileInput)
-				os.Remove(fileOutput)
-			}
-		}
+	// helper to send failure reaction
+	sendFail := func() {
+		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "❌")
 	}
 
-	return true // Berhasil dicegat, return true agar di handler.go berhenti (tidak double-proses)
+	// 5) Download & re-upload based on detected media type
+	if imgMsg != nil {
+		// Try to download image
+		data, err = client.Download(ctx, imgMsg)
+		if err != nil {
+			// fallback: try downloading using DocumentMessage if present elsewhere
+			sendFail()
+			return true
+		}
+		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaImage)
+		if errUpload != nil {
+			sendFail()
+			return true
+		}
+		captionStr := baseCaptionPrefix + "\n" + imgMsg.GetCaption()
+		client.SendMessage(ctx, targetJID, &proto.Message{
+			ImageMessage: &proto.ImageMessage{
+				URL:           &uploaded.URL,
+				DirectPath:    &uploaded.DirectPath,
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    &uploaded.FileLength,
+				Mimetype:      imgMsg.Mimetype,
+				Caption:       &captionStr,
+			},
+		})
+		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+	} else if vidMsg != nil {
+		data, err = client.Download(ctx, vidMsg)
+		if err != nil {
+			sendFail()
+			return true
+		}
+		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaVideo)
+		if errUpload != nil {
+			sendFail()
+			return true
+		}
+		captionStr := baseCaptionPrefix + "\n" + vidMsg.GetCaption()
+		client.SendMessage(ctx, targetJID, &proto.Message{
+			VideoMessage: &proto.VideoMessage{
+				URL:           &uploaded.URL,
+				DirectPath:    &uploaded.DirectPath,
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    &uploaded.FileLength,
+				Mimetype:      vidMsg.Mimetype,
+				Caption:       &captionStr,
+			},
+		})
+		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+	} else if audMsg != nil {
+		data, err = client.Download(ctx, audMsg)
+		if err != nil {
+			sendFail()
+			return true
+		}
+
+		// convert to mp3 as before
+		fileInput := fmt.Sprintf("temp_pasif_in_%s.ogg", m.Info.ID)
+		fileOutput := fmt.Sprintf("temp_pasif_out_%s.mp3", m.Info.ID)
+
+		err = os.WriteFile(fileInput, data, 0644)
+		if err != nil {
+			sendFail()
+			return true
+		}
+		cmd := exec.Command("ffmpeg", "-y", "-i", fileInput, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", fileOutput)
+		if errCmd := cmd.Run(); errCmd != nil {
+			os.Remove(fileInput)
+			sendFail()
+			return true
+		}
+		audioData, errRead := os.ReadFile(fileOutput)
+		if errRead != nil {
+			os.Remove(fileInput)
+			os.Remove(fileOutput)
+			sendFail()
+			return true
+		}
+		uploaded, errUpload := client.Upload(ctx, audioData, whatsmeow.MediaAudio)
+		if errUpload != nil {
+			os.Remove(fileInput)
+			os.Remove(fileOutput)
+			sendFail()
+			return true
+		}
+		isPTT := true
+		mpegMime := "audio/mpeg"
+		client.SendMessage(ctx, targetJID, &proto.Message{
+			AudioMessage: &proto.AudioMessage{
+				URL:           &uploaded.URL,
+				DirectPath:    &uploaded.DirectPath,
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    &uploaded.FileLength,
+				Mimetype:      &mpegMime,
+				PTT:           &isPTT,
+			},
+		})
+		os.Remove(fileInput)
+		os.Remove(fileOutput)
+		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+	} else if docMsg != nil {
+		// Try to download document and re-send as DocumentMessage (keeps original filename/mimetype)
+		data, err = client.Download(ctx, docMsg)
+		if err != nil {
+			sendFail()
+			return true
+		}
+		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaDocument)
+		if errUpload != nil {
+			sendFail()
+			return true
+		}
+		captionStr := baseCaptionPrefix + "\n" + docMsg.GetFileName()
+		client.SendMessage(ctx, targetJID, &proto.Message{
+			DocumentMessage: &proto.DocumentMessage{
+				URL:           &uploaded.URL,
+				DirectPath:    &uploaded.DirectPath,
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    &uploaded.FileLength,
+				Mimetype:      docMsg.Mimetype,
+				FileName:      docMsg.FileName,
+				Caption:       &captionStr,
+			},
+		})
+		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+	}
+
+	return true // dicegat, hentikan pemrosesan lebih lanjut di handler
 }
 
 func sendReactionRVO(client *whatsmeow.Client, chat types.JID, msgID string, emoji string) {

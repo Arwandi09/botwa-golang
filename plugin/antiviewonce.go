@@ -100,9 +100,10 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	sendReactionRVO(client, m.Info.Chat, m.Info.ID, "🕒")
 
 	// 4) Prepare source info for caption
-	senderNumber := "unknown"
-	if m.Info.Sender != nil {
-		senderNumber = m.Info.Sender.User
+	// m.Info.Sender is of type types.JID (non-pointer). Don't compare to nil.
+	senderNumber := m.Info.Sender.User
+	if strings.TrimSpace(senderNumber) == "" {
+		senderNumber = "unknown"
 	}
 	senderName := m.Info.PushName
 	if strings.TrimSpace(senderName) == "" {
@@ -112,9 +113,9 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	groupName := "-"
 	if m.Info.IsGroup {
 		origin = "Grup"
-		// Try to fetch group name (best-effort)
+		// Try to fetch group name (best-effort). GroupInfo has field Name, not GetName().
 		if gi, err := client.GetGroupInfo(ctx, m.Info.Chat); err == nil {
-			groupName = gi.GetName()
+			groupName = gi.Name
 		} else {
 			// fallback to chat id
 			groupName = m.Info.Chat.String()

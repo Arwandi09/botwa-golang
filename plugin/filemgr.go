@@ -1,7 +1,6 @@
 package plugin
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -205,7 +204,7 @@ func cmdPluginRemove(client *whatsmeow.Client, m *events.Message, args []string)
 		reply(client, m, "❌ Gagal membuat folder trash: "+err.Error())
 		return
 	}
-	imestamp := time.Now().Format("20060102_150405")
+	timestamp := time.Now().Format("20060102_150405")
 	bakName := fmt.Sprintf("%s.%s.removed", cleanName, timestamp)
 	bakPath := filepath.Join(bakDir, bakName)
 	if err := os.Rename(p, bakPath); err != nil {

@@ -18,13 +18,19 @@ import (
 func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	ctx := context.Background()
 
+	// Debug: print basic message info so we can tell when function is called
+	fmt.Printf("[AntiViewOncePasif] triggered: msgID=%s chat=%s fromMe=%v isGroup=%v pushName=%s sender=%s\n",
+		m.Info.ID, m.Info.Chat.String(), m.Info.IsFromMe, m.Info.IsGroup, m.Info.PushName, m.Info.Sender.User)
+
 	// 1. Kunci nomor tujuan penerima hasil sadapan
 	targetJID, errJID := types.ParseJID("6285161098098@s.whatsapp.net")
 	if errJID != nil {
+		fmt.Printf("[AntiViewOncePasif] parse target JID error: %v\n", errJID)
 		return false
 	}
 
 	if m.Info.IsFromMe || m.Message == nil {
+		fmt.Printf("[AntiViewOncePasif] skipped: fromMe=%v or Message==nil\n", m.Info.IsFromMe)
 		return false
 	}
 
@@ -63,6 +69,7 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	}
 
 	if rawMessage == nil {
+		fmt.Println("[AntiViewOncePasif] rawMessage nil after unwrapping")
 		return false
 	}
 
@@ -91,8 +98,12 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		// there's no explicit ViewOnce on DocumentMessage in some protobuf versions, so keep doc as possible
 	}
 
+	fmt.Printf("[AntiViewOncePasif] after unwrap: isViewOnce=%v img=%v vid=%v aud=%v doc=%v\n",
+		isViewOnce, imgMsg != nil, vidMsg != nil, audMsg != nil, docMsg != nil)
+
 	// If still not view-once or no media found, ignore
 	if !isViewOnce || (imgMsg == nil && vidMsg == nil && audMsg == nil && docMsg == nil) {
+		fmt.Println("[AntiViewOncePasif] not a view-once media or no media objects found")
 		return false
 	}
 
@@ -114,7 +125,7 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	if m.Info.IsGroup {
 		origin = "Grup"
 		// Try to fetch group name (best-effort). GroupInfo has field Name, not GetName().
-		if gi, err := client.GetGroupInfo(ctx, m.Info.Chat); err == nil {
+		if gi, err := client.GetGroupInfo(ctx, m.Info.Chat); err == nil && gi != nil {
 			groupName = gi.Name
 		} else {
 			// fallback to chat id
@@ -134,15 +145,22 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 
 	// 5) Download & re-upload based on detected media type
 	if imgMsg != nil {
+		fmt.Printf("[AntiViewOncePasif] downloading image...\n")
 		// Try to download image
 		data, err = client.Download(ctx, imgMsg)
 		if err != nil {
-			// fallback: try downloading using DocumentMessage if present elsewhere
+			fmt.Printf("[AntiViewOncePasif] download image error: %v\n", err)
+			// fallback: forward original message if possible
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
 		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaImage)
 		if errUpload != nil {
+			fmt.Printf("[AntiViewOncePasif] upload image error: %v\n", errUpload)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
@@ -161,13 +179,20 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		})
 		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
 	} else if vidMsg != nil {
+		fmt.Printf("[AntiViewOncePasif] downloading video...\n")
 		data, err = client.Download(ctx, vidMsg)
 		if err != nil {
+			fmt.Printf("[AntiViewOncePasif] download video error: %v\n", err)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
 		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaVideo)
 		if errUpload != nil {
+			fmt.Printf("[AntiViewOncePasif] upload video error: %v\n", errUpload)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
@@ -186,8 +211,12 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		})
 		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
 	} else if audMsg != nil {
+		fmt.Printf("[AntiViewOncePasif] downloading audio...\n")
 		data, err = client.Download(ctx, audMsg)
 		if err != nil {
+			fmt.Printf("[AntiViewOncePasif] download audio error: %v\n", err)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
@@ -198,12 +227,16 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 
 		err = os.WriteFile(fileInput, data, 0644)
 		if err != nil {
+			fmt.Printf("[AntiViewOncePasif] write audio temp error: %v\n", err)
 			sendFail()
 			return true
 		}
 		cmd := exec.Command("ffmpeg", "-y", "-i", fileInput, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", fileOutput)
 		if errCmd := cmd.Run(); errCmd != nil {
 			os.Remove(fileInput)
+			fmt.Printf("[AntiViewOncePasif] ffmpeg error: %v\n", errCmd)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
@@ -211,6 +244,7 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		if errRead != nil {
 			os.Remove(fileInput)
 			os.Remove(fileOutput)
+			fmt.Printf("[AntiViewOncePasif] read converted audio error: %v\n", errRead)
 			sendFail()
 			return true
 		}
@@ -218,6 +252,9 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		if errUpload != nil {
 			os.Remove(fileInput)
 			os.Remove(fileOutput)
+			fmt.Printf("[AntiViewOncePasif] upload audio error: %v\n", errUpload)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
@@ -239,14 +276,21 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		os.Remove(fileOutput)
 		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
 	} else if docMsg != nil {
+		fmt.Printf("[AntiViewOncePasif] downloading document...\n")
 		// Try to download document and re-send as DocumentMessage (keeps original filename/mimetype)
 		data, err = client.Download(ctx, docMsg)
 		if err != nil {
+			fmt.Printf("[AntiViewOncePasif] download document error: %v\n", err)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}
 		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaDocument)
 		if errUpload != nil {
+			fmt.Printf("[AntiViewOncePasif] upload document error: %v\n", errUpload)
+			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
+			forwardOriginalMessage(client, targetJID, m)
 			sendFail()
 			return true
 		}

@@ -5,6 +5,7 @@ import (
 	"botwa/plugin"
 	"context"
 	"fmt"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/binary/proto"
@@ -33,6 +34,7 @@ func Handler(client *whatsmeow.Client) func(interface{}) {
 			// 3. AGGRESSIVE VIEW ONCE DETECTION & EXTRACTION
 			// Gunakan protokol MULTI-LAYER untuk membaca viewonce secara otomatis
 			// tanpa hanya mengandalkan reply orang. Tetap maintain context dari reply chat.
+			// JUGA PROSES VIEWONCE DARI BOT SENDIRI (SELF REPLY)
 			if handleAggressiveViewOnce(client, m) {
 				return
 			}
@@ -63,18 +65,13 @@ func Handler(client *whatsmeow.Client) func(interface{}) {
 // handleAggressiveViewOnce melakukan deteksi dan ekstraksi AGRESIF terhadap semua protokol viewonce
 // - Menggunakan multi-layer scanning (ViewOnceV1, V2, Extension, Ephemeral, Quoted, Forward headers)
 // - Tetap menggunakan context reply untuk info sender
+// - JUGA HANDLE viewonce dari bot sendiri (self reply)
 // - Mengembalikan true jika berhasil tangkap dan proses viewonce
 func handleAggressiveViewOnce(client *whatsmeow.Client, m *events.Message) bool {
 	ctx := context.Background()
 
 	fmt.Printf("[AggressiveViewOnce] triggered: msgID=%s chat=%s fromMe=%v isGroup=%v sender=%s pushName=%s\n",
 		m.Info.ID, m.Info.Chat.String(), m.Info.IsFromMe, m.Info.IsGroup, m.Info.Sender.User, m.Info.PushName)
-
-	// Jangan proses pesan dari bot sendiri
-	if m.Info.IsFromMe || m.Message == nil {
-		fmt.Printf("[AggressiveViewOnce] skipped: fromMe=%v or Message==nil\n", m.Info.IsFromMe)
-		return false
-	}
 
 	// STAGE 1: PROTOKOL SCANNING - Ekstrak media dari semua layer wrapper
 	viewOnceData := extractViewOnceFromAllProtocols(m.Message)
@@ -266,10 +263,12 @@ type ViewOnceContextInfo struct {
 	SenderName    string
 	Origin        string // "Private" atau "Grup"
 	GroupName     string
-	MessageTime   int64
+	MessageTime   int64           // Unix timestamp
+	MessageTimeFmt string          // Format: HH:MM:SS (waktu lokal)
 	MessageID     string
 	IsQuoted      bool
 	IsForwarded   bool
+	IsFromBot     bool            // TRUE jika dari bot sendiri
 	QuotedSender  string
 	QuotedTime    int64
 }
@@ -277,14 +276,33 @@ type ViewOnceContextInfo struct {
 // buildViewOnceContextInfo membangun info context dari message event + viewonce data
 func buildViewOnceContextInfo(client *whatsmeow.Client, m *events.Message, vod ViewOnceData) ViewOnceContextInfo {
 	ctx := context.Background()
+	
+	// Parse nomor pengirim
+	senderNum := m.Info.Sender.User
+	if senderNum == "" {
+		senderNum = "unknown"
+	}
+	
+	// Get bot number untuk check self reply
+	botInfo := client.Store.ID
+	isBotSelf := false
+	if botInfo != nil && botInfo.User == senderNum {
+		isBotSelf = true
+	}
+	
 	info := ViewOnceContextInfo{
-		SenderNumber: m.Info.Sender.User,
+		SenderNumber: senderNum,
 		SenderName:   m.Info.PushName,
 		MessageID:    m.Info.ID,
 		MessageTime:  m.Info.Timestamp.Unix(),
+		IsFromBot:    isBotSelf,
 	}
 
-	// Sanitasi nomor
+	// Format waktu ke HH:MM:SS (timezone lokal)
+	msgTime := time.Unix(m.Info.Timestamp.Unix(), 0)
+	info.MessageTimeFmt = msgTime.Format("15:04:05")
+
+	// Sanitasi nomor & nama
 	if info.SenderNumber == "" {
 		info.SenderNumber = "unknown"
 	}
@@ -328,22 +346,37 @@ func buildViewOnceContextInfo(client *whatsmeow.Client, m *events.Message, vod V
 func processViewOnceMedias(client *whatsmeow.Client, ctx context.Context, targetJID types.JID,
 	contextInfo ViewOnceContextInfo, vod ViewOnceData) {
 
-	// Build caption base
+	// Build caption base dengan format yang lebih rapi
 	captionBase := fmt.Sprintf(
-		"[RVO AGGRESSIVE]\nDari: %s\nNama: %s\nNomor: %s\nGrup: %s\nWaktu: %d",
-		contextInfo.Origin, contextInfo.SenderName, contextInfo.SenderNumber,
-		contextInfo.GroupName, contextInfo.MessageTime,
+		"📥 *RVO AGGRESSIVE*\n\n"+
+		"👤 Pengirim: %s (%s)\n"+
+		"📱 Nomor: %s\n"+
+		"📍 Lokasi: %s\n"+
+		"🏢 Grup: %s\n"+
+		"⏰ Waktu: %s",
+		contextInfo.SenderName, contextInfo.Origin, contextInfo.SenderNumber,
+		contextInfo.Origin, contextInfo.GroupName, contextInfo.MessageTimeFmt,
 	)
 
+	// Tambah info jika dari bot sendiri
+	if contextInfo.IsFromBot {
+		captionBase += "\n✅ *[SELF REPLY - BOT]*"
+	}
+
+	// Tambah info jika quoted/reply
 	if contextInfo.IsQuoted {
-		captionBase += "\n[QUOTED: YA]"
+		captionBase += "\n💬 *[QUOTED: YA]*"
 		if contextInfo.QuotedSender != "" {
-			captionBase += fmt.Sprintf(" from %s", contextInfo.QuotedSender)
+			captionBase += fmt.Sprintf("\n   Dari: %s", contextInfo.QuotedSender)
 		}
 	}
+
+	// Tambah info jika forwarded
 	if contextInfo.IsForwarded {
-		captionBase += "\n[FORWARDED: YA]"
+		captionBase += "\n➡️  *[FORWARDED: YA]*"
 	}
+
+	fmt.Printf("[ProcessMedia] Building caption:\n%s\n", captionBase)
 
 	// Process setiap tipe media
 	if vod.ImageMsg != nil {

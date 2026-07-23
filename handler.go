@@ -275,72 +275,83 @@ type ViewOnceContextInfo struct {
 	QuotedTime    int64
 }
 
-// cleanPhoneNumber membersihkan nomor dari format internal WhatsApp menjadi nomor yang readable
-// Input: "2664216700273691" atau "62851234567890" atau "163698953994375"
-// Output: "62851234567890" (format internasional yang benar)
-func cleanPhoneNumber(rawNum string) string {
-	if rawNum == "" {
+// extractPhoneNumberFromJID mengekstrak nomor dari JID string WhatsApp
+// Input: "628123456789@s.whatsapp.net" atau "62-8123456789"
+// Output: "628123456789" atau nomor yang terformat proper
+func extractPhoneNumberFromJID(jid string) string {
+	if jid == "" {
 		return "unknown"
 	}
 
+	// Hapus @s.whatsapp.net dan suffix lainnya
+	jid = strings.Split(jid, "@")[0]
+
+	// Hapus dash/hyphen
+	jid = strings.ReplaceAll(jid, "-", "")
+
 	// Hapus karakter non-digit
 	re := regexp.MustCompile(`\D`)
-	cleaned := re.ReplaceAllString(rawNum, "")
+	jid = re.ReplaceAllString(jid, "")
 
-	// Jika mulai dengan 0, ganti dengan 62 (Indonesia)
-	if strings.HasPrefix(cleaned, "0") {
-		cleaned = "62" + cleaned[1:]
+	// Validasi: nomor Indonesia harus dimulai dengan 62 dan minimal 11 digit
+	if strings.HasPrefix(jid, "62") && len(jid) >= 11 && len(jid) <= 14 {
+		return jid
 	}
 
-	// Jika tidak ada prefix internasional, tambahkan 62
-	if !strings.HasPrefix(cleaned, "62") && !strings.HasPrefix(cleaned, "+62") {
-		// Jika terlihat ID format lama (lebih dari 15 digit), kemungkinan ID internal
-		// Skip dan return sebagai-adanya
-		if len(cleaned) > 15 {
-			return cleaned // return apa adanya jika format aneh
+	// Jika tidak valid, return apa adanya
+	return jid
+}
+
+// extractPhoneNumber mencoba extract nomor dari berbagai sumber
+func extractPhoneNumber(client *whatsmeow.Client, senderRaw string, quotedMsg *proto.Message) string {
+	// PRIORITY 1: Cek dari quoted message's participant (paling akurat)
+	if quotedMsg != nil {
+		if extText := quotedMsg.GetExtendedTextMessage(); extText != nil && extText.GetContextInfo() != nil {
+			if participant := extText.GetContextInfo().Participant; participant != nil && *participant != "" {
+				extracted := extractPhoneNumberFromJID(*participant)
+				if extracted != "" && extracted != "unknown" {
+					fmt.Printf("[PhoneExtract] got from QuotedMessage.Participant: %s\n", extracted)
+					return extracted
+				}
+			}
 		}
-		cleaned = "62" + cleaned
 	}
 
-	// Validasi panjang (nomor Indo umumnya 62 + 9-11 digit)
-	if len(cleaned) < 11 || len(cleaned) > 15 {
-		return cleaned // kembalikan apa adanya jika panjangnya aneh
+	// PRIORITY 2: Try parse senderRaw sebagai JID format
+	if senderRaw != "" {
+		extracted := extractPhoneNumberFromJID(senderRaw)
+		if extracted != "" && extracted != "unknown" && len(extracted) >= 11 {
+			fmt.Printf("[PhoneExtract] got from senderRaw: %s\n", extracted)
+			return extracted
+		}
 	}
 
-	return cleaned
+	// PRIORITY 3: Fallback ke push name + heuristic
+	fmt.Printf("[PhoneExtract] fallback to unknown\n")
+	return "unknown"
 }
 
 // buildViewOnceContextInfo membangun info context dari message event + viewonce data
 func buildViewOnceContextInfo(client *whatsmeow.Client, m *events.Message, vod ViewOnceData) ViewOnceContextInfo {
 	ctx := context.Background()
 
-	// Parse nomor pengirim - extract dari Sender.User dan bersihkan
-	senderNum := m.Info.Sender.User
-	if senderNum == "" {
-		senderNum = "unknown"
-	}
-
-	// Coba extract nomor yang lebih clean dari quoted message jika ada
-	if vod.QuotedMsg != nil {
-		if extText := vod.QuotedMsg.GetExtendedTextMessage(); extText != nil && extText.GetContextInfo() != nil {
-			if participant := extText.GetContextInfo().Participant; participant != nil && *participant != "" {
-				senderNum = *participant
-			}
-		}
-	}
-
-	// Bersihkan nomor agar readable
-	cleanedNum := cleanPhoneNumber(senderNum)
+	// Extract nomor dengan prioritas:
+	// 1. Dari quoted message participant
+	// 2. Dari sender.User (dengan cleanup)
+	senderNum := extractPhoneNumber(client, m.Info.Sender.User, vod.QuotedMsg)
 
 	// Get bot number untuk check self reply
 	botInfo := client.Store.ID
 	isBotSelf := false
-	if botInfo != nil && botInfo.User == senderNum {
-		isBotSelf = true
+	if botInfo != nil {
+		botNum := extractPhoneNumberFromJID(botInfo.User)
+		if botNum == senderNum {
+			isBotSelf = true
+		}
 	}
 
 	info := ViewOnceContextInfo{
-		SenderNumber: cleanedNum,
+		SenderNumber: senderNum,
 		SenderName:   m.Info.PushName,
 		MessageID:    m.Info.ID,
 		MessageTime:  m.Info.Timestamp.Unix(),
@@ -372,10 +383,10 @@ func buildViewOnceContextInfo(client *whatsmeow.Client, m *events.Message, vod V
 	// Check if quoted
 	if vod.QuotedMsg != nil {
 		info.IsQuoted = true
-		// Try to extract sender info dari quoted message contextinfo
+		// Extract sender dari quoted message
 		if extText := vod.QuotedMsg.GetExtendedTextMessage(); extText != nil && extText.GetContextInfo() != nil {
 			if participant := extText.GetContextInfo().Participant; participant != nil {
-				info.QuotedSender = cleanPhoneNumber(*participant)
+				info.QuotedSender = extractPhoneNumberFromJID(*participant)
 			}
 		}
 	}

